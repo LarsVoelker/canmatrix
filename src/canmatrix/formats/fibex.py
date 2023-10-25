@@ -473,25 +473,194 @@ def dump(db, f, **options):
         create_short_name_desc(pdu, "PDU_" + frame.name, frame.comment)
         create_sub_element_fx(pdu, "BYTE-LENGTH", str(frame.size))  # DLC
         create_sub_element_fx(pdu, "PDU-TYPE", "APPLICATION")
-        signal_instances = create_sub_element_fx(pdu, "SIGNAL-INSTANCES")
-        for signal in frame.signals:
-            signal_id = frame.name + "." + signal.name
-            signal_instance = create_sub_element_fx(
-                signal_instances, "SIGNAL-INSTANCE")
-            signal_instance.set("ID", "PDUINST_" + signal_id)
-            # startBit: TODO - find out correct BYTEORDER ...
-            create_sub_element_fx(signal_instance, "BIT-POSITION",
-                                  str(signal.start_bit))
-            if signal.is_little_endian:
-                create_sub_element_fx(
-                    signal_instance,
-                    "IS-HIGH-LOW-BYTE-ORDER",
-                    "false")  # true:big endian; false:little endian
+
+        if frame.is_multiplexed:
+            mux = create_sub_element_fx(pdu, "MULTIPLEXER")
+
+            signals_static = []
+            signals_dynamic = {}
+            signals_switch = []
+
+            for signal in frame.signals:
+                if signal.is_multiplexer:
+                    signals_switch.append(signal)
+                elif signal.multiplex is not None or signal.mux_val is not None:
+                    if signal.multiplex != signal.mux_val:
+                        print(f"ERROR: For Signal {signal.name} mux_val {signal.mux_val} != multiplex {signal.multiplex}")
+                    sigs = signals_dynamic.setdefault(signal.mux_val, [])
+                    sigs.append(signal)
+                else:
+                    signals_static.append(signal)
+
+            if len(signals_switch) != 1 or len(signals_dynamic) == 0:
+                print(f"Warning: Frame {frame.name} has an invalid multiplexer or dyn Part! "
+                      f"Switch Signals: {len(signals_switch)} "
+                      f"Dyn Signals: {len(signals_dynamic)} "
+                      f"Static Signals: {len(signals_static)}")
+
+
+            # SWITCH
+            mux_switch = create_sub_element_fx(mux, "SWITCH")
+            mux_switch.set("ID", "PDU_" + frame.name + "_SWITCH")
+            create_sub_element_ho(mux_switch, "SHORT-NAME", signals_switch[0].name)
+            create_sub_element_fx(mux_switch, "BIT-POSITION", str(signals_switch[0].start_bit))
+            create_sub_element_fx(mux_switch, "IS-HIGH-LOW-BYTE-ORDER",
+                                  "false" if signals_switch[0].is_little_endian else "true")
+            create_sub_element_ho(mux_switch, "BIT-LENGTH", str(signals_switch[0].size))
+
+            # DYNAMIC PART
+            start_pos = -1
+            end_pos = -1
+            seg_big_endian = None
+
+            for sigs in signals_dynamic.values():
+                for signal in sigs:
+                    if start_pos == -1 or signal.start_bit < start_pos:
+                        start_pos = signal.start_bit
+
+                    tmp_end_pos = signal.start_bit + signal.size
+                    if end_pos == -1 or tmp_end_pos > end_pos:
+                        end_pos = tmp_end_pos
+
+                    if seg_big_endian is not None and seg_big_endian == signal.is_little_endian:
+                        print(f"Warning: Inconsistent Byte Order for frame {frame.name} {signal.name}")
+                    seg_big_endian = not signal.is_little_endian
+
+            if seg_big_endian is None:
+                seg_big_endian = False
+
+            if start_pos >= 0:
+
+                print(f"Dyn part: bit {start_pos} - {end_pos} "
+                      f"(Frame: {frame.name} Signal: {signal.name})")
+
+                mux_dynpart = create_sub_element_fx(mux, "DYNAMIC-PART")
+                mux_dynpart.set("ID", "PDU_" + frame.name + "_DYN_PART")
+                create_sub_element_ho(mux_dynpart, "SHORT-NAME", signal.name)
+
+                seg_positions = create_sub_element_fx(mux_dynpart, "SEGMENT-POSITIONS")
+                seg_position = create_sub_element_fx(seg_positions, "SEGMENT-POSITION")
+                create_sub_element_fx(seg_position, "BIT-POSITION", str(start_pos))
+                create_sub_element_fx(seg_position, "IS-HIGH-LOW-BYTE-ORDER", "true" if seg_big_endian else "false")
+                create_sub_element_ho(seg_position, "BIT-LENGTH", str(end_pos - start_pos))
+
+                sw_pdu_instances = create_sub_element_fx(mux_dynpart, "SWITCHED-PDU-INSTANCES")
+
+                for mux_key in sorted(signals_dynamic.keys()):
+                    # create PDU for these signals
+                    mux_key_pdu = create_sub_element_fx(pdus, "PDU")
+                    mux_key_pdu_id = f"PDU_{frame.name}_DYNPART_{str(mux_key)}"
+                    mux_key_pdu.set("ID", mux_key_pdu_id)
+                    create_short_name_desc(mux_key_pdu, mux_key_pdu_id, "")
+                    create_sub_element_fx(mux_key_pdu, "BYTE-LENGTH", str(end_pos - start_pos))
+                    create_sub_element_fx(mux_key_pdu, "PDU-TYPE", "APPLICATION")
+
+                    signal_instances = create_sub_element_fx(mux_key_pdu, "SIGNAL-INSTANCES")
+                    for signal in signals_dynamic[mux_key]:
+                        signal_id = frame.name + "." + signal.name
+                        signal_instance = create_sub_element_fx(signal_instances, "SIGNAL-INSTANCE")
+                        signal_instance.set("ID", "PDUINST_" + signal_id)
+                        # startBit: TODO - find out correct BYTEORDER ...
+                        create_sub_element_fx(signal_instance, "BIT-POSITION", str(signal.start_bit))
+                        if signal.is_little_endian:
+                            create_sub_element_fx(
+                                signal_instance,
+                                "IS-HIGH-LOW-BYTE-ORDER",
+                                "false")  # true:big endian; false:little endian
+                        else:
+                            create_sub_element_fx(
+                                signal_instance, "IS-HIGH-LOW-BYTE-ORDER", "true")
+                        signal_ref = create_sub_element_fx(signal_instance, "SIGNAL-REF")
+                        signal_ref.set("ID-REF", "SIG_" + signal_id)
+
+                    # create SWITCHED-PDU-INSTANCE that refs mux_key_pdu_id
+                    switched_pdu_inst = create_sub_element_fx(sw_pdu_instances, "SWITCHED-PDU-INSTANCE")
+                    switched_pdu_inst.set("ID", mux_key_pdu_id + "_SWITCHED_PDU_INSTANCE")
+                    pdu_ref = create_sub_element_fx(switched_pdu_inst, "PDU-REF")
+                    pdu_ref.set("ID-REF", mux_key_pdu_id)
+                    create_sub_element_fx(switched_pdu_inst, "SWITCH-CODE", str(mux_key))
+
+            # STATIC PART
+            start_pos = -1
+            end_pos = -1
+            seg_big_endian = None
+
+            for signal in signals_static:
+                if start_pos == -1 or signal.start_bit < start_pos:
+                    start_pos = signal.start_bit
+
+                tmp_end_pos = signal.start_bit + signal.size
+                if end_pos == -1 or tmp_end_pos > end_pos:
+                    end_pos = tmp_end_pos
+
+                if seg_big_endian is not None and seg_big_endian == signal.is_little_endian:
+                    print(f"Warning: Inconsisten Byte Order for frame {frame.name} {signal.name}")
+                seg_big_endian = not signal.is_little_endian
+
+            if start_pos == -1 or end_pos == -1:
+                print(f"ERROR: we could not determine start and length for STATIC PART of {frame.name}")
             else:
-                create_sub_element_fx(
-                    signal_instance, "IS-HIGH-LOW-BYTE-ORDER", "true")
-            signal_ref = create_sub_element_fx(signal_instance, "SIGNAL-REF")
-            signal_ref.set("ID-REF", "SIG_" + signal_id)
+                static_part = create_sub_element_fx(mux, "STATIC-PART")
+                static_part.set("ID", "PDU_" + frame.name + "_STATIC_PART")
+                seg_positions = create_sub_element_fx(static_part, "SEGMENT-POSITIONS")
+                seg_position = create_sub_element_fx(seg_positions, "SEGMENT-POSITION")
+                create_sub_element_fx(seg_position, "BIT-POSITION", str(start_pos))
+                create_sub_element_fx(seg_position, "IS-HIGH-LOW-BYTE-ORDER", "true" if seg_big_endian else "false")
+                create_sub_element_ho(seg_position, "BIT-LENGTH", str(end_pos - start_pos))
+
+                # create static PDU
+                static_pdu = create_sub_element_fx(pdus, "PDU")
+                static_pdu_key = f"PDU_{frame.name}_STATIC_PART_PDU"
+                static_pdu.set("ID", static_pdu_key)
+                create_short_name_desc(static_pdu, static_pdu_key, "")
+                create_sub_element_fx(static_pdu, "BYTE-LENGTH", str(end_pos - start_pos))
+                create_sub_element_fx(static_pdu, "PDU-TYPE", "APPLICATION")
+                signal_instances = create_sub_element_fx(static_pdu, "SIGNAL-INSTANCES")
+                for signal in signals_static:
+                    signal_id = frame.name + "." + signal.name
+                    signal_instance = create_sub_element_fx(signal_instances, "SIGNAL-INSTANCE")
+                    signal_instance.set("ID", "PDUINST_" + signal_id + "_STATIC_PART")
+                    # startBit: TODO - find out correct BYTEORDER ...
+                    create_sub_element_fx(signal_instance, "BIT-POSITION", str(signal.start_bit))
+                    if signal.is_little_endian:
+                        create_sub_element_fx(
+                            signal_instance,
+                            "IS-HIGH-LOW-BYTE-ORDER",
+                            "false")  # true:big endian; false:little endian
+                    else:
+                        create_sub_element_fx(
+                            signal_instance,
+                            "IS-HIGH-LOW-BYTE-ORDER",
+                            "true")
+                    signal_ref = create_sub_element_fx(signal_instance, "SIGNAL-REF")
+                    signal_ref.set("ID-REF", "SIG_" + signal_id)
+
+                # create STATIC-PDU-INSTANCE that refs static_pdu_key
+                static_pdu_inst = create_sub_element_fx(static_part, "STATIC-PDU-INSTANCE")
+                static_pdu_inst.set("ID", static_pdu_key + "_SWITCHED-PDU-INSTANCE")
+                pdu_ref = create_sub_element_fx(static_pdu_inst, "PDU-REF")
+                pdu_ref.set("ID-REF", static_pdu_key)
+
+        else:
+            # PDU without Multiplexing
+            signal_instances = create_sub_element_fx(pdu, "SIGNAL-INSTANCES")
+            for signal in frame.signals:
+                signal_id = frame.name + "." + signal.name
+                signal_instance = create_sub_element_fx(
+                    signal_instances, "SIGNAL-INSTANCE")
+                signal_instance.set("ID", "PDUINST_" + signal_id)
+                # startBit: TODO - find out correct BYTEORDER ...
+                create_sub_element_fx(signal_instance, "BIT-POSITION", str(signal.start_bit))
+                if signal.is_little_endian:
+                    create_sub_element_fx(
+                        signal_instance,
+                        "IS-HIGH-LOW-BYTE-ORDER",
+                        "false")  # true:big endian; false:little endian
+                else:
+                    create_sub_element_fx(
+                        signal_instance, "IS-HIGH-LOW-BYTE-ORDER", "true")
+                signal_ref = create_sub_element_fx(signal_instance, "SIGNAL-REF")
+                signal_ref.set("ID-REF", "SIG_" + signal_id)
 
     # FRAMES
     #
