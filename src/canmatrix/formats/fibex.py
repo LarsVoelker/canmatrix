@@ -69,6 +69,45 @@ def create_sub_element_fx(parent, element_name, element_text=None):
         new.text = element_text
     return new
 
+def get_multiplexing_parts_infos(signals, frame_name):
+    # type: (list[Signal], str) -> (int, int, bool)
+    start_pos = -1
+    end_pos = -1
+    seg_big_endian = None
+
+    for signal in signals:
+        if start_pos == -1 or signal.start_bit < start_pos:
+            start_pos = signal.start_bit
+        
+        tmp_end_pos = signal.start_bit + signal.size
+        if end_pos == -1 or tmp_end_pos > end_pos:
+            end_pos = tmp_end_pos
+        
+        if seg_big_endian is not None and seg_big_endian == signal.is_little_endian:
+            mux_info = f" with mux_val {signal.mux_val}" if signal.mux_val else ""
+            print(f"Warning: Inconsistent Byte Order for frame {frame_name} {signal.name}{mux_info}")
+            seg_big_endian = not signal.is_little_endian
+    return (start_pos, end_pos, seg_big_endian)
+
+def create_signal_instance_fx(parent, signal, signal_id):
+    # type: (_Element, Signal, str) -> _Element
+    signal_instance = create_sub_element_fx(parent, "SIGNAL-INSTANCE")
+    signal_instance.set("ID", "PDUINST_" + signal_id)
+    # startBit: TODO - find out correct BYTEORDER ...
+    create_sub_element_fx(signal_instance, "BIT-POSITION", str(signal.start_bit))
+    is_little_endian = not signal.is_little_endian
+    create_sub_element_fx(signal_instance, "IS-HIGH-LOW-BYTE-ORDER", "false" if is_little_endian else "true")
+    return signal_instance
+
+def create_signal_ref_fx(parent, signal_ref_id):
+    # type: (_Element, str) -> _Element
+    signal_ref = create_sub_element_fx(parent, "SIGNAL-REF")
+    signal_ref.set("ID-REF", "SIG_" + signal_ref_id)
+    return signal_ref
+
+def create_signal_id(frame, signal):
+    # type: (Frame, Signal) -> str
+    return f"{frame.name}.{signal.name}_{str(signal.mux_val)}" if signal.mux_val else f"{frame.name}.{signal.name}"
 
 def create_sub_element_ho(parent, element_name, element_text=None):
     # type: (_Element, str, typing.Optional[str]) -> _Element
@@ -509,22 +548,8 @@ def dump(db, f, **options):
             create_sub_element_ho(mux_switch, "BIT-LENGTH", str(signals_switch[0].size))
 
             # DYNAMIC PART
-            start_pos = -1
-            end_pos = -1
-            seg_big_endian = None
-
             for sigs in signals_dynamic.values():
-                for signal in sigs:
-                    if start_pos == -1 or signal.start_bit < start_pos:
-                        start_pos = signal.start_bit
-
-                    tmp_end_pos = signal.start_bit + signal.size
-                    if end_pos == -1 or tmp_end_pos > end_pos:
-                        end_pos = tmp_end_pos
-
-                    if seg_big_endian is not None and seg_big_endian == signal.is_little_endian:
-                        print(f"Warning: Inconsistent Byte Order for frame {frame.name} {signal.name}")
-                    seg_big_endian = not signal.is_little_endian
+                (start_pos, end_pos, seg_big_endian) = get_multiplexing_parts_infos(sigs, frame.name)
 
             if seg_big_endian is None:
                 seg_big_endian = False
@@ -557,21 +582,9 @@ def dump(db, f, **options):
 
                     signal_instances = create_sub_element_fx(mux_key_pdu, "SIGNAL-INSTANCES")
                     for signal in signals_dynamic[mux_key]:
-                        signal_id = frame.name + "." + signal.name
-                        signal_instance = create_sub_element_fx(signal_instances, "SIGNAL-INSTANCE")
-                        signal_instance.set("ID", "PDUINST_" + signal_id)
-                        # startBit: TODO - find out correct BYTEORDER ...
-                        create_sub_element_fx(signal_instance, "BIT-POSITION", str(signal.start_bit))
-                        if signal.is_little_endian:
-                            create_sub_element_fx(
-                                signal_instance,
-                                "IS-HIGH-LOW-BYTE-ORDER",
-                                "false")  # true:big endian; false:little endian
-                        else:
-                            create_sub_element_fx(
-                                signal_instance, "IS-HIGH-LOW-BYTE-ORDER", "true")
-                        signal_ref = create_sub_element_fx(signal_instance, "SIGNAL-REF")
-                        signal_ref.set("ID-REF", "SIG_" + signal_id)
+                        signal_id = create_signal_id(frame, signal)
+                        signal_instance = create_signal_instance_fx(signal_instances, signal, signal_id)
+                        signal_ref = create_signal_ref_fx(signal_instance, signal_id)
 
                     # create SWITCHED-PDU-INSTANCE that refs mux_key_pdu_id
                     switched_pdu_inst = create_sub_element_fx(sw_pdu_instances, "SWITCHED-PDU-INSTANCE")
@@ -581,21 +594,7 @@ def dump(db, f, **options):
                     create_sub_element_fx(switched_pdu_inst, "SWITCH-CODE", str(mux_key))
 
             # STATIC PART
-            start_pos = -1
-            end_pos = -1
-            seg_big_endian = None
-
-            for signal in signals_static:
-                if start_pos == -1 or signal.start_bit < start_pos:
-                    start_pos = signal.start_bit
-
-                tmp_end_pos = signal.start_bit + signal.size
-                if end_pos == -1 or tmp_end_pos > end_pos:
-                    end_pos = tmp_end_pos
-
-                if seg_big_endian is not None and seg_big_endian == signal.is_little_endian:
-                    print(f"Warning: Inconsisten Byte Order for frame {frame.name} {signal.name}")
-                seg_big_endian = not signal.is_little_endian
+            (start_pos, end_pos, seg_big_endian) = get_multiplexing_parts_infos(signals_static, frame.name)
 
             if start_pos == -1 or end_pos == -1:
                 print(f"ERROR: we could not determine start and length for STATIC PART of {frame.name}")
@@ -617,23 +616,9 @@ def dump(db, f, **options):
                 create_sub_element_fx(static_pdu, "PDU-TYPE", "APPLICATION")
                 signal_instances = create_sub_element_fx(static_pdu, "SIGNAL-INSTANCES")
                 for signal in signals_static:
-                    signal_id = frame.name + "." + signal.name
-                    signal_instance = create_sub_element_fx(signal_instances, "SIGNAL-INSTANCE")
-                    signal_instance.set("ID", "PDUINST_" + signal_id + "_STATIC_PART")
-                    # startBit: TODO - find out correct BYTEORDER ...
-                    create_sub_element_fx(signal_instance, "BIT-POSITION", str(signal.start_bit))
-                    if signal.is_little_endian:
-                        create_sub_element_fx(
-                            signal_instance,
-                            "IS-HIGH-LOW-BYTE-ORDER",
-                            "false")  # true:big endian; false:little endian
-                    else:
-                        create_sub_element_fx(
-                            signal_instance,
-                            "IS-HIGH-LOW-BYTE-ORDER",
-                            "true")
-                    signal_ref = create_sub_element_fx(signal_instance, "SIGNAL-REF")
-                    signal_ref.set("ID-REF", "SIG_" + signal_id)
+                    signal_id = f"{frame.name}.{signal.name}_STATIC_PART"
+                    signal_instance = create_signal_instance_fx(signal_instances, signal, signal_id)
+                    signal_ref = create_signal_ref_fx(signal_instance, signal_id)
 
                 # create STATIC-PDU-INSTANCE that refs static_pdu_key
                 static_pdu_inst = create_sub_element_fx(static_part, "STATIC-PDU-INSTANCE")
@@ -645,22 +630,9 @@ def dump(db, f, **options):
             # PDU without Multiplexing
             signal_instances = create_sub_element_fx(pdu, "SIGNAL-INSTANCES")
             for signal in frame.signals:
-                signal_id = frame.name + "." + signal.name
-                signal_instance = create_sub_element_fx(
-                    signal_instances, "SIGNAL-INSTANCE")
-                signal_instance.set("ID", "PDUINST_" + signal_id)
-                # startBit: TODO - find out correct BYTEORDER ...
-                create_sub_element_fx(signal_instance, "BIT-POSITION", str(signal.start_bit))
-                if signal.is_little_endian:
-                    create_sub_element_fx(
-                        signal_instance,
-                        "IS-HIGH-LOW-BYTE-ORDER",
-                        "false")  # true:big endian; false:little endian
-                else:
-                    create_sub_element_fx(
-                        signal_instance, "IS-HIGH-LOW-BYTE-ORDER", "true")
-                signal_ref = create_sub_element_fx(signal_instance, "SIGNAL-REF")
-                signal_ref.set("ID-REF", "SIG_" + signal_id)
+                signal_id = create_signal_id(frame, signal)
+                signal_instance = create_signal_instance_fx(signal_instances, signal, signal_id)
+                signal_ref = create_signal_ref_fx(signal_instance, signal_id)
 
     # FRAMES
     #
@@ -690,26 +662,25 @@ def dump(db, f, **options):
         input_ports = create_sub_element_fx(function, "INPUT-PORTS")
         for frame in db.frames:
             for signal in frame.signals:
-                signal_id = frame.name + "." + signal.name
+                signal_id = create_signal_id(frame, signal)
                 if bu.name in signal.receivers:
                     input_port = create_sub_element_fx(input_ports, "INPUT-PORT")
                     input_port.set("ID", "INP_" + signal_id)
                     desc = lxml.etree.SubElement(input_port, ns_ho + "DESC")
                     desc.text = signal.comment
-                    signal_ref = create_sub_element_fx(input_port, "SIGNAL-REF")
-                    signal_ref.set("ID-REF", "SIG_" + signal_id)
+                    signal_ref = create_signal_ref_fx(input_port, signal_id)
 
         output_ports = create_sub_element_fx(function, "OUTPUT-PORTS")
         for frame in db.frames:
             if bu.name in frame.transmitters:
                 for signal in frame.signals:
-                    signal_id = frame.name + "." + signal.name
+                    signal_id = create_signal_id(frame, signal)
                     output_port = create_sub_element_fx(output_ports, "OUTPUT-PORT")
                     output_port.set("ID", "OUTP_" + signal_id)
                     desc = lxml.etree.SubElement(output_port, ns_ho + "DESC")
                     desc.text = "signalcomment"
-                    signal_ref = create_sub_element_fx(output_port, "SIGNAL-REF")
-                    signal_ref.set("ID-REF", "SIG_" + frame.name + "_" + signal_id)
+                    signal_ref_id = frame.name + "_" + signal_id
+                    signal_ref = create_signal_ref_fx(input_port, signal_ref_id)
 
     #
     # SIGNALS
@@ -717,7 +688,7 @@ def dump(db, f, **options):
     signals = create_sub_element_fx(elements, "SIGNALS")
     for frame in db.frames:
         for signal in frame.signals:
-            signal_id = frame.name + "." + signal.name
+            signal_id = create_signal_id(frame, signal)
             signal_element = create_sub_element_fx(signals, "SIGNAL")
             signal_element.set("ID", "SIG_" + signal_id)
             create_short_name_desc(signal_element, signal.name, signal.comment)
@@ -731,7 +702,7 @@ def dump(db, f, **options):
     unit_spec = create_sub_element_ho(proc_info, "UNIT-SPEC")
     for frame in db.frames:
         for signal in frame.signals:
-            signal_id = frame.name + "." + signal.name
+            signal_id = create_signal_id(frame, signal)
             unit = create_sub_element_ho(unit_spec, "UNIT")
             unit.set("ID", "UNIT_" + signal_id)
             create_sub_element_ho(unit, "SHORT-NAME", signal.name)
@@ -740,7 +711,7 @@ def dump(db, f, **options):
     codings = create_sub_element_fx(proc_info, "CODINGS")
     for frame in db.frames:
         for signal in frame.signals:
-            signal_id = frame.name + "." + signal.name
+            signal_id = create_signal_id(frame, signal)
             coding = create_sub_element_fx(codings, "CODING")
             coding.set("ID", "CODING_" + signal_id)
             create_short_name_desc(
